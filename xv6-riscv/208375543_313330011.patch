@@ -1,0 +1,935 @@
+diff --git a/Makefile b/Makefile
+index 328f9c6..5c5f1fc 100644
+--- a/Makefile
++++ b/Makefile
+@@ -62,6 +62,7 @@ CFLAGS += -mcmodel=medany
+ CFLAGS += -ffreestanding -fno-common -nostdlib -mno-relax
+ CFLAGS += -I.
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
++CFLAGS += -D $(SCHEDFLAG)
+ 
+ # Disable PIE when possible (for Ubuntu 16.10 toolchain)
+ ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]no-pie'),)
+@@ -71,6 +72,10 @@ ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]nopie'),)
+ CFLAGS += -fno-pie -nopie
+ endif
+ 
++ifndef SCHEDFLAG
++SCHEDFLAG := DEFAULT
++endif
++
+ LDFLAGS = -z max-page-size=4096
+ 
+ $K/kernel: $(OBJS) $K/kernel.ld $U/initcode
+@@ -132,6 +137,9 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_test\
++	$U/_syscall\
++	$U/_env\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+@@ -153,7 +161,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 3
++CPUS := 1
+ endif
+ 
+ QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+diff --git a/Makefile_nitzan b/Makefile_nitzan
+new file mode 100644
+index 0000000..2357a22
+--- /dev/null
++++ b/Makefile_nitzan
+@@ -0,0 +1,178 @@
++K=kernel
++U=user
++
++OBJS = \
++  $K/entry.o \
++  $K/start.o \
++  $K/console.o \
++  $K/printf.o \
++  $K/uart.o \
++  $K/kalloc.o \
++  $K/spinlock.o \
++  $K/string.o \
++  $K/main.o \
++  $K/vm.o \
++  $K/proc.o \
++  $K/swtch.o \
++  $K/trampoline.o \
++  $K/trap.o \
++  $K/syscall.o \
++  $K/sysproc.o \
++  $K/bio.o \
++  $K/fs.o \
++  $K/log.o \
++  $K/sleeplock.o \
++  $K/file.o \
++  $K/pipe.o \
++  $K/exec.o \
++  $K/sysfile.o \
++  $K/kernelvec.o \
++  $K/plic.o \
++  $K/virtio_disk.o
++
++# riscv64-unknown-elf- or riscv64-linux-gnu-
++# perhaps in /opt/riscv/bin
++#TOOLPREFIX = 
++
++# Try to infer the correct TOOLPREFIX if not set
++ifndef TOOLPREFIX
++TOOLPREFIX := $(shell if riscv64-unknown-elf-objdump -i 2>&1 | grep 'elf64-big' >/dev/null 2>&1; \
++	then echo 'riscv64-unknown-elf-'; \
++	elif riscv64-linux-gnu-objdump -i 2>&1 | grep 'elf64-big' >/dev/null 2>&1; \
++	then echo 'riscv64-linux-gnu-'; \
++	elif riscv64-unknown-linux-gnu-objdump -i 2>&1 | grep 'elf64-big' >/dev/null 2>&1; \
++	then echo 'riscv64-unknown-linux-gnu-'; \
++	else echo "***" 1>&2; \
++	echo "*** Error: Couldn't find a riscv64 version of GCC/binutils." 1>&2; \
++	echo "*** To turn off this error, run 'gmake TOOLPREFIX= ...'." 1>&2; \
++	echo "***" 1>&2; exit 1; fi)
++endif
++
++QEMU = qemu-system-riscv64
++
++CC = $(TOOLPREFIX)gcc
++AS = $(TOOLPREFIX)gas
++LD = $(TOOLPREFIX)ld
++OBJCOPY = $(TOOLPREFIX)objcopy
++OBJDUMP = $(TOOLPREFIX)objdump
++
++CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb
++CFLAGS += -MD
++CFLAGS += -mcmodel=medany
++CFLAGS += -ffreestanding -fno-common -nostdlib -mno-relax
++CFLAGS += -I.
++CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
++
++# Disable PIE when possible (for Ubuntu 16.10 toolchain)
++ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]no-pie'),)
++CFLAGS += -fno-pie -no-pie
++endif
++ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]nopie'),)
++CFLAGS += -fno-pie -nopie
++endif
++
++LDFLAGS = -z max-page-size=4096
++
++$K/kernel: $(OBJS) $K/kernel.ld $U/initcode
++	$(LD) $(LDFLAGS) -T $K/kernel.ld -o $K/kernel $(OBJS) 
++	$(OBJDUMP) -S $K/kernel > $K/kernel.asm
++	$(OBJDUMP) -t $K/kernel | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $K/kernel.sym
++
++$U/initcode: $U/initcode.S
++	$(CC) $(CFLAGS) -march=rv64g -nostdinc -I. -Ikernel -c $U/initcode.S -o $U/initcode.o -D $(POLICY)
++	$(LD) $(LDFLAGS) -N -e start -Ttext 0 -o $U/initcode.out $U/initcode.o
++	$(OBJCOPY) -S -O binary $U/initcode.out $U/initcode
++	$(OBJDUMP) -S $U/initcode.o > $U/initcode.asm
++
++tags: $(OBJS) _init
++	etags *.S *.c
++
++ULIB = $U/ulib.o $U/usys.o $U/printf.o $U/umalloc.o
++
++_%: %.o $(ULIB)
++	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $@ $^
++	$(OBJDUMP) -S $@ > $*.asm
++	$(OBJDUMP) -t $@ | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $*.sym
++
++$U/usys.S : $U/usys.pl
++	perl $U/usys.pl > $U/usys.S
++
++$U/usys.o : $U/usys.S
++	$(CC) $(CFLAGS) -c -o $U/usys.o $U/usys.S -D $(POLICY)
++
++$U/_forktest: $U/forktest.o $(ULIB)
++	# forktest has less library code linked in - needs to be small
++	# in order to be able to max out the proc table.
++	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $U/_forktest $U/forktest.o $U/ulib.o $U/usys.o
++	$(OBJDUMP) -S $U/_forktest > $U/forktest.asm
++
++mkfs/mkfs: mkfs/mkfs.c $K/fs.h $K/param.h
++	gcc -Werror -Wall -I. -o mkfs/mkfs mkfs/mkfs.c
++
++# Prevent deletion of intermediate files, e.g. cat.o, after first build, so
++# that disk image changes after first build are persistent until clean.  More
++# details:
++# http://www.gnu.org/software/make/manual/html_node/Chained-Rules.html
++.PRECIOUS: %.o
++
++UPROGS=\
++	$U/_cat\
++	$U/_echo\
++	$U/_forktest\
++	$U/_grep\
++	$U/_init\
++	$U/_kill\
++	$U/_ln\
++	$U/_ls\
++	$U/_mkdir\
++	$U/_rm\
++	$U/_sh\
++	$U/_stressfs\
++	$U/_usertests\
++	$U/_grind\
++	$U/_wc\
++	$U/_zombie\
++	$U/_syscall\
++	$U/_env\
++
++fs.img: mkfs/mkfs README $(UPROGS)
++	mkfs/mkfs fs.img README $(UPROGS)
++
++-include kernel/*.d user/*.d
++
++clean: 
++	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg \
++	*/*.o */*.d */*.asm */*.sym \
++	$U/initcode $U/initcode.out $K/kernel fs.img \
++	mkfs/mkfs .gdbinit \
++        $U/usys.S \
++	$(UPROGS)
++
++# try to generate a unique GDB port
++GDBPORT = $(shell expr `id -u` % 5000 + 25000)
++# QEMU's gdb stub command line changed in 0.11
++QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
++	then echo "-gdb tcp::$(GDBPORT)"; \
++	else echo "-s -p $(GDBPORT)"; fi)
++ifndef CPUS
++CPUS := 1
++endif
++
++ifndef POLICY
++POLICY := RR
++endif
++
++QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
++QEMUOPTS += -drive file=fs.img,if=none,format=raw,id=x0
++QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
++
++qemu: $K/kernel fs.img
++	$(QEMU) $(QEMUOPTS)
++
++.gdbinit: .gdbinit.tmpl-riscv
++	sed "s/:1234/:$(GDBPORT)/" < $^ > $@
++
++qemu-gdb: $K/kernel .gdbinit fs.img
++	@echo "*** Now run 'gdb' in another window." 1>&2
++	$(QEMU) $(QEMUOPTS) -S $(QEMUGDB)
++
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 3564db4..63e7703 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -104,6 +104,9 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++int             kill_system(void);
++int             pause_system(int);
++int             print_stats(void);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+diff --git a/kernel/param.h b/kernel/param.h
+index b5fdcb2..120e1c8 100644
+--- a/kernel/param.h
++++ b/kernel/param.h
+@@ -1,5 +1,5 @@
+ #define NPROC        64  // maximum number of processes
+-#define NCPU          8  // maximum number of CPUs
++#define NCPU          1 // maximum number of CPUs
+ #define NOFILE       16  // open files per process
+ #define NFILE       100  // open files per system
+ #define NINODE       50  // maximum number of active i-nodes
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22e7ce4..187e045 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -5,9 +5,21 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include <limits.h>
+ 
+ struct cpu cpus[NCPU];
+ 
++uint pause_tick;
++int paused;
++int rate;
++int runnable_processes_mean;
++int sleeping_processes_mean;
++int running_time_mean;
++int total_proccesses;
++int program_time;
++int cpu_utillization;
++int start_time;
++
+ struct proc proc[NPROC];
+ 
+ struct proc *initproc;
+@@ -47,7 +59,19 @@ void
+ procinit(void)
+ {
+   struct proc *p;
++
++pause_tick = 0;
++paused = 0;
++rate = 5;
++runnable_processes_mean = 0;
++sleeping_processes_mean = 0;
++running_time_mean = 0;
++total_proccesses = 0;
++program_time = 0;
++cpu_utillization = 0;
++start_time = 0;
+   
++  start_time = ticks;
+   initlock(&pid_lock, "nextpid");
+   initlock(&wait_lock, "wait_lock");
+   for(p = proc; p < &proc[NPROC]; p++) {
+@@ -119,6 +143,12 @@ allocproc(void)
+ found:
+   p->pid = allocpid();
+   p->state = USED;
++  p->last_ticks = 0;
++  p->mean_ticks = 0;
++  p->runnable_time = 0;
++  p->running_time = 0;
++  p->sleeping_time = 0;
++  p->last_runnable_time = ticks;
+ 
+   // Allocate a trapframe page.
+   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+@@ -243,6 +273,8 @@ userinit(void)
+   p->cwd = namei("/");
+ 
+   p->state = RUNNABLE;
++  p->curr_ticks_runnable = ticks;
++  p->last_runnable_time = ticks;
+ 
+   release(&p->lock);
+ }
+@@ -313,6 +345,8 @@ fork(void)
+ 
+   acquire(&np->lock);
+   np->state = RUNNABLE;
++  np->curr_ticks_runnable = ticks;
++  np->last_runnable_time=ticks;
+   release(&np->lock);
+ 
+   return pid;
+@@ -344,6 +378,7 @@ exit(int status)
+   if(p == initproc)
+     panic("init exiting");
+ 
++
+   // Close all open files.
+   for(int fd = 0; fd < NOFILE; fd++){
+     if(p->ofile[fd]){
+@@ -369,10 +404,17 @@ exit(int status)
+   acquire(&p->lock);
+ 
+   p->xstate = status;
++  
+   p->state = ZOMBIE;
+ 
+   release(&wait_lock);
+-
++  p->running_time += ticks - p->curr_ticks_running;
++  running_time_mean =  ((running_time_mean*total_proccesses)+p->running_time) / (total_proccesses+1);
++  sleeping_processes_mean = ((sleeping_processes_mean *total_proccesses) + p->sleeping_time) / (total_proccesses +1) ;
++  runnable_processes_mean = ((runnable_processes_mean*total_proccesses)+p->runnable_time) / (total_proccesses+1);
++  total_proccesses += 1;
++  program_time += p->running_time;
++  cpu_utillization = (program_time*100) / (ticks-start_time);
+   // Jump into the scheduler, never to return.
+   sched();
+   panic("zombie exit");
+@@ -445,25 +487,103 @@ scheduler(void)
+     // Avoid deadlock by ensuring that devices can interrupt.
+     intr_on();
+ 
++
++    #ifdef DEFAULT
+     for(p = proc; p < &proc[NPROC]; p++) {
+-      acquire(&p->lock);
+-      if(p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+-        swtch(&c->context, &p->context);
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
++      if (p->pid != 2 && p->pid != 1 && paused == 1 && pause_tick - ticks > 0)
++      {
++        break;
+       }
+-      release(&p->lock);
++      else{
++        acquire(&p->lock);
++        if(p->state == RUNNABLE) {
++            // Switch to chosen process.  It is the process's job
++            // to release its lock and then reacquire it
++            // before jumping back to us.
++        // if(pause == 0){
++          p->state = RUNNING;
++          p->runnable_time += ticks - p->curr_ticks_runnable;
++          c->proc = p;
++          p->curr_ticks_running = ticks;
++          swtch(&c->context, &p->context);
++          p->running_time += ticks - p->curr_ticks_running;
++          
++
++            // Process is done running for now.
++            // It should have changed its p->state before coming back.
++          c->proc = 0;
++          
++          }
++        release(&p->lock);
++      }
++        
++    }
++    #elif SJF
++  uint xticks;
++  struct proc *next_proc;
++  int define =0;
++  uint min_mean_ticks= UINT_MAX;
++
++  for(p = proc; p < &proc[NPROC]; p++) {
++    if (p->pid != 2 && p->pid != 1 && paused == 1 && pause_tick - ticks > 0)
++      {
++        break;
++      }
++    acquire(&p->lock);
++    if(p->mean_ticks <= min_mean_ticks && p->state == RUNNABLE){
++      min_mean_ticks=p->mean_ticks;
++      next_proc=p;
++      define = 1;
+     }
++    release(&p->lock);
++  }
++    if(define == 1){
++      acquire(&next_proc->lock);
++      xticks = ticks;       
++      next_proc->state = RUNNING;
++      next_proc->runnable_time += ticks - next_proc->curr_ticks_runnable;
++      c->proc = next_proc;
++      next_proc->curr_ticks_running = ticks;
++      swtch(&c->context, &next_proc->context);
++      next_proc->running_time += ticks - next_proc->curr_ticks_running;
++      c->proc = 0;
++      next_proc->last_ticks = ticks - xticks;
++      next_proc->mean_ticks =((10 - rate) * next_proc->mean_ticks + next_proc->last_ticks * (rate)) / 10;
++      release(&next_proc->lock);
++    }
++    #elif FCFS
++      struct proc *next_proc;
++      int define = 0;
++      uint min_last_runnable=UINT_MAX;
++      for(p = proc; p < &proc[NPROC]; p++) {
++        if (p->pid != 2 && p->pid != 1 && paused == 1 && pause_tick - ticks > 0)
++      {
++        break;
++      }
++        acquire(&p->lock); 
++        if(p->state == RUNNABLE && p->last_runnable_time <= min_last_runnable){
++          min_last_runnable = p->last_runnable_time;
++          next_proc = p;
++          define =1;
++        }
++         release(&p->lock);
++      }
++      if (define == 1){
++        acquire(&next_proc->lock);      
++        next_proc->state = RUNNING;
++        next_proc->runnable_time += ticks - next_proc->curr_ticks_runnable;
++        c->proc = next_proc;
++        next_proc->curr_ticks_running = ticks;
++        swtch(&c->context, &next_proc->context);
++        next_proc->running_time += ticks - next_proc->curr_ticks_running;
++        c->proc = 0;
++        release(&next_proc->lock);
++      }
++    #endif
+   }
+ }
+ 
++
+ // Switch to scheduler.  Must hold only p->lock
+ // and have changed proc->state. Saves and restores
+ // intena because intena is a property of this
+@@ -497,7 +617,10 @@ yield(void)
+ {
+   struct proc *p = myproc();
+   acquire(&p->lock);
++  p->running_time += ticks - p->curr_ticks_running;
+   p->state = RUNNABLE;
++  p->curr_ticks_runnable = ticks;
++  p->last_runnable_time=ticks;
+   sched();
+   release(&p->lock);
+ }
+@@ -542,7 +665,9 @@ sleep(void *chan, struct spinlock *lk)
+ 
+   // Go to sleep.
+   p->chan = chan;
++  p->curr_ticks_sleeping = ticks;
+   p->state = SLEEPING;
++  
+ 
+   sched();
+ 
+@@ -566,6 +691,9 @@ wakeup(void *chan)
+       acquire(&p->lock);
+       if(p->state == SLEEPING && p->chan == chan) {
+         p->state = RUNNABLE;
++        p->curr_ticks_runnable = ticks;
++        p->sleeping_time +=ticks - p-> curr_ticks_sleeping;
++        p->last_runnable_time=ticks;
+       }
+       release(&p->lock);
+     }
+@@ -579,6 +707,7 @@ int
+ kill(int pid)
+ {
+   struct proc *p;
++  
+ 
+   for(p = proc; p < &proc[NPROC]; p++){
+     acquire(&p->lock);
+@@ -587,6 +716,9 @@ kill(int pid)
+       if(p->state == SLEEPING){
+         // Wake process from sleep().
+         p->state = RUNNABLE;
++        p->sleeping_time += ticks - p-> curr_ticks_sleeping;
++        p->curr_ticks_runnable = ticks;
++        p->last_runnable_time=ticks;
+       }
+       release(&p->lock);
+       return 0;
+@@ -596,6 +728,49 @@ kill(int pid)
+   return -1;
+ }
+ 
++
++int 
++kill_system(void){
++  struct proc *p;
++
++   for(p = proc; p < &proc[NPROC]; p++) {
++    if(p->pid != 2 && p->pid != 1){
++      acquire(&p->lock);
++      p->killed = 1;
++      if(p->state == SLEEPING){
++        // Wake process from sleep().
++        p->state = RUNNABLE;
++        p->sleeping_time += ticks - p-> curr_ticks_sleeping;
++        p->curr_ticks_runnable = ticks;
++        p->last_runnable_time=ticks;
++      }
++      release(&p->lock);
++    }
++  }
++  return 0;
++}
++
++int
++pause_system(int seconds){
++  // struct proc *p;
++  pause_tick = seconds * 10 + ticks;
++  paused=1;
++   yield();
++  paused=0;
++  return 0;
++}
++
++int
++print_stats(void){
++  printf("runnable_processes_mean: %d\n", runnable_processes_mean);
++  printf("sleeping_processes_mean: %d\n" , sleeping_processes_mean);
++  printf( "running_time_mean: %d\n" , running_time_mean);
++  printf("program_time: %d\n" , program_time);
++  printf ("cpu_utillization: %d\n" , cpu_utillization);
++  return 0;
++}
++
++
+ // Copy to either a user address, or kernel address,
+ // depending on usr_dst.
+ // Returns 0 on success, -1 on error.
+diff --git a/kernel/proc.h b/kernel/proc.h
+index f6ca8b7..868f4db 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -92,6 +92,15 @@ struct proc {
+   int killed;                  // If non-zero, have been killed
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
++  int last_ticks;
++  int mean_ticks;
++  int last_runnable_time;
++  int sleeping_time;
++  int runnable_time;
++  int running_time;
++  int curr_ticks_running;
++  int curr_ticks_runnable;
++  int curr_ticks_sleeping;
+ 
+   // wait_lock must be held when using this:
+   struct proc *parent;         // Parent process
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..1fba0af 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,9 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_kill_system(void);
++extern uint64 sys_pause_system(void);
++extern uint64 sys_print_stats(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +130,9 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_kill_system]  sys_kill_system,
++[SYS_pause_system]  sys_pause_system,
++[SYS_print_stats]   sys_print_stats,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..51d4f2b 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,6 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_kill_system  22
++#define SYS_pause_system 23
++#define SYS_print_stats 24
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..47ce08e 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -95,3 +95,26 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_kill_system(void)
++{
++  return kill_system();
++}
++
++uint64
++sys_pause_system(void)
++{
++  int seconds;
++
++  if(argint(0, &seconds) < 0)
++    return -1;
++  return pause_system(seconds);
++}
++
++uint64
++sys_print_stats(void)
++{
++  return print_stats();
++}
++
+diff --git a/user/env.c b/user/env.c
+new file mode 100644
+index 0000000..bfb453e
+--- /dev/null
++++ b/user/env.c
+@@ -0,0 +1,153 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fs.h"
++#include "kernel/fcntl.h"
++#include "kernel/syscall.h"
++#include "kernel/memlayout.h"
++#include "kernel/riscv.h"
++
++
++
++void test(int num_of_copies, int num_of_intervals, char* test_name, char* num_of_tmpfile){
++    char* str = "Hello, my name is Steve Gonzales\nWelcome to my Test File for XV6 Schedulers\nFeel free to put notes ;)";
++    int str_size = 102;
++
++    int buff_size = str_size / num_of_intervals;
++    char buff [buff_size];
++    buff[buff_size - 1] = 0;
++
++    int fd = open(num_of_tmpfile, O_CREATE | O_RDWR);
++
++    for (int i = 0; i < num_of_copies; i++){
++        int str_cursor = 0;
++        while(str_cursor < str_size){
++            //set buffer
++            for(int k = 0; k < (buff_size - 1); k++){
++                if (str_cursor < str_size){
++                    buff[k] = str[str_cursor];
++                }
++                else{
++                    buff[k] = 0 ;
++                }
++                str_cursor++;
++            }
++            // Write to file
++            write(fd, buff, buff_size);
++            //sleep(100);
++        }
++        printf("pid=%d - %s completed %d/%d copies.\n", getpid(), test_name, (i+1), num_of_copies);
++    }
++    close(fd);
++    unlink(num_of_tmpfile);
++}
++void run_test(int n_forks) {
++    int pid; 
++    int child_pid [n_forks];
++    for (int i = 0; i < n_forks; i++){
++        pid = fork();
++        if (pid != 0){
++            child_pid[i] = pid;
++        }
++        else{
++            char num_of_tmpfile [2];
++            num_of_tmpfile[0] = i - '0';
++            num_of_tmpfile[1] = 0;
++            char* argv[] = {"env", num_of_tmpfile, 0};
++            exec(argv[0], argv);
++            exit(0);
++        }
++    }
++    // Wait for all child processes before exiting test
++    for (int i = 0; i < n_forks; i++){
++        int status;
++        wait(&status);
++    }
++    printf("Father process pid = %d\n", getpid());
++    printf("Children processes pid:");
++     for (int i = 0; i < n_forks; i++){
++        printf("%d ", child_pid[i]);
++    }
++    printf("\n");
++}
++
++void short_test(char* num_of_tmpfile) {
++    test(10, 10, "short_test", num_of_tmpfile);
++}
++
++void long_test(char* num_of_tmpfile) {
++    test(100, 100, "long_test", num_of_tmpfile);
++}
++
++int main (int argc, char *argv []){
++    int n_forks = 5;
++    if(argc == 1){
++        run_test(n_forks);
++        print_stats();
++    }
++    else if(argc == 2){
++       short_test(argv[1]);
++    }
++    else{
++        printf("Error - wrong input - no more then 2 arguments are allowed");
++    }
++    exit(0);
++}
++
++// #include "kernel/param.h"
++// #include "kernel/types.h"
++// #include "kernel/stat.h"
++// #include "user/user.h"
++// #include "kernel/fs.h"
++// #include "kernel/fcntl.h"
++// #include "kernel/syscall.h"
++// #include "kernel/memlayout.h"
++// #include "kernel/riscv.h"
++
++
++
++
++// void env(int size, int interval, char* env_name) {
++//     int result = 1;
++//     int loop_size = 10e6;
++//     int n_forks = 2;
++//     int pid;
++//     for (int i = 0; i < n_forks; i++) {
++//        pid = fork();
++//     }
++//     for (int i = 0; i < loop_size; i++) {
++//         if (i % (loop_size / (int) 10e0) == 0) {
++//         	if (pid == 0) {
++//         		printf("%s %d/%d completed.\n", env_name, i, loop_size);
++//         	} else {
++//         		printf(" ");
++//         	}
++//         }
++//         if (i % interval == 0) {
++//             result = result * size;
++//         }
++//     }
++//     printf("\n");
++  
++// }
++
++// void env_large() {
++//     env(10e6, 10e6, "env_large");
++// }
++
++// void env_freq() {
++//     env(10e1, 10e1, "env_freq");
++// }
++
++
++// int
++// main(int argc, char *argv[]){
++//     env_large();
++//     env_freq();
++//     print_stats();
++   
++    
++//     exit(0);
++
++// }
+\ No newline at end of file
+diff --git a/user/syscall.c b/user/syscall.c
+new file mode 100644
+index 0000000..97571bc
+--- /dev/null
++++ b/user/syscall.c
+@@ -0,0 +1,62 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fs.h"
++#include "kernel/fcntl.h"
++#include "kernel/syscall.h"
++#include "kernel/memlayout.h"
++#include "kernel/riscv.h"
++#include "kernel/types.h"
++#include "user/user.h"
++#include "kernel/fcntl.h"
++
++void pause_system_dem(int interval, int pause_seconds, int loop_size) {
++    int pid = getpid();
++    for (int i = 0; i < loop_size; i++) {
++        if (i % interval == 0 && pid == getpid()) {
++            printf("pause system %d/%d completed.\n", i, loop_size);
++        }
++        if (i == loop_size / 2) {
++            pause_system(pause_seconds);
++        }
++    }
++    printf("\n");
++}
++
++void kill_system_dem(int interval, int loop_size) {
++    int pid = getpid();
++    for (int i = 0; i < loop_size; i++) {
++        if (i % interval == 0 && pid == getpid()) {
++            printf("kill system %d/%d completed.\n", i, loop_size);
++        }
++        if (i == loop_size / 2) {
++            kill_system();
++        }
++    }
++    printf("\n");
++}
++
++
++void set_economic_mode_dem(int interval, int loop_size) {
++    int pid = getpid();
++    // set_economic_mode(1);
++    for (int i = 0; i < loop_size; i++) {
++        if (i % interval == 0 && pid == getpid()) {
++            printf("set economic mode %d/%d completed.\n", i, loop_size);
++        }
++        if (i == loop_size / 2) {
++            // set_economic_mode(0);
++        }
++    }
++    printf("\n");
++}
++
++int
++main(int argc, char *argv[])
++{
++    // set_economic_mode_dem(10, 100);
++    pause_system_dem(10, 10, 100);
++    kill_system_dem(10, 100);
++    exit(0);
++}
+\ No newline at end of file
+diff --git a/user/test.c b/user/test.c
+new file mode 100644
+index 0000000..78d3c4a
+--- /dev/null
++++ b/user/test.c
+@@ -0,0 +1,18 @@
++#include "kernel/types.h"
++#include "user/user.h"
++#include "kernel/fcntl.h"
++
++
++int main(int argc, char**argv){
++    fprintf(2, "hey1\n");
++    int pid = fork();
++
++    pause_system(5);
++   
++    
++    fprintf(2, "hey2\n");
++    if(pid == 0){
++        print_stats();
++    }
++    exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index b71ecda..48c8058 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -23,6 +23,9 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int kill_system(void);
++int pause_system(int);
++int print_stats(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..6c88074 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,6 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("kill_system");
++entry("pause_system");
++entry("print_stats");
